@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Education Analytics Dashboard</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.css"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* keep your existing CSS here */
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="map"></div>
+  <div id="sidebar">
+    <div class="header">
+      <h1>Education Analytics</h1>
+      <div class="subtitle">Advanced Geographic Intelligence Platform</div>
+    </div>
+    <div class="content">
+      <div class="section">
+        <div class="section-header">
+          <div class="section-title"><span class="icon icon-map"></span>Spatial Selection Tools</div>
+          <div class="controls">
+            <button id="zoomAll" class="btn btn-secondary">Zoom All</button>
+            <button id="resetAll" class="btn btn-primary">Reset</button>
+          </div>
+        </div>
+        <div class="controls">
+          <button id="clearDraw" class="btn btn-secondary">Clear Selection</button>
+        </div>
+      </div>
+      <div class="section">
+        <div class="section-header">
+          <div class="section-title"><span class="icon icon-filter"></span>Search & Filters</div>
+          <div class="input-group">
+            <input id="zipSearch" class="form-input" placeholder="ZIP code..." style="width: 100px;">
+          </div>
+        </div>
+        <div class="filter-grid" id="filters"></div>
+      </div>
+      <div class="section">
+        <div class="stats-card">
+          <div class="stats-row"><span class="stats-label">Total Features:</span><span class="stats-value" id="totalCount">0</span></div>
+          <div class="stats-row"><span class="stats-label">Filtered Features:</span><span class="stats-value" id="filteredCount">0</span></div>
+          <div class="stats-row"><span class="stats-label">Selected Features:</span><span class="stats-value" id="selectedCount">0</span></div>
+          <div class="stats-row"><span class="stats-label">Unique ZIPs:</span><span class="stats-value" id="uniqueZipsCount">0</span></div>
+        </div>
+      </div>
+      <div class="section">
+        <div class="section-header">
+          <div class="section-title"><span class="icon icon-table"></span>Aggregated Summary by ZIP Code</div>
+        </div>
+        <div class="table-container">
+          <table id="summary" class="display" width="100%">
+            <thead></thead><tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="footer"><strong>data.geojson</strong> • Select features to see aggregated results</div>
+  </div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script src="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/turf@6.5.0/turf.min.js"></script>
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+<script>
+(async function(){
+  const GEOJSON_FILE = "data.geojson";
+  const res = await fetch(GEOJSON_FILE);
+  const rawData = await res.json();
+  const allFeatures = rawData.features;
+  const sampleProps = allFeatures[0].properties;
+  const zipKey = Object.keys(sampleProps).find(k => /zip/i.test(k));
+  const numericFields = Object.keys(sampleProps).filter(k => typeof sampleProps[k] === 'number' && k !== zipKey);
+  const state = {filters:{}, drawnLayer:null, selectedZips:new Set(), filteredFeatures:[...allFeatures], aggregatedData:[]};
+  document.getElementById('totalCount').textContent = allFeatures.length;
+
+  const map = L.map('map').setView([39.5,-98.35], 4);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{attribution:'© OpenStreetMap © CARTO'}).addTo(map);
+
+  function createGeoLayer(features){
+    if (window.geoLayer) map.removeLayer(window.geoLayer);
+    window.geoLayer = L.geoJSON(features,{
+      style:f=>state.selectedZips.has(f.properties[zipKey])?{color:'#f5576c',weight:3,fillOpacity:0.4}:{color:'#667eea',weight:2,fillOpacity:0.15},
+      onEachFeature:(feature,layer)=>{
+        layer.on('click',()=>{
+          const zipVal = feature.properties[zipKey];
+          if(state.selectedZips.has(zipVal)) state.selectedZips.delete(zipVal); else state.selectedZips.add(zipVal);
+          updateAggregation(); updateStats(); createGeoLayer(state.filteredFeatures);
+        });
+      }
+    }).addTo(map);
+  }
+
+  function selectFeaturesInDrawnArea(){
+    if(!state.drawnLayer)return;
+    state.selectedZips.clear();
+    const drawnGeoJSON=state.drawnLayer.toGeoJSON();
+    allFeatures.forEach(f=>{
+      if(turf.booleanIntersects(f,drawnGeoJSON)) state.selectedZips.add(f.properties[zipKey]);
+    });
+    updateAggregation();updateStats();createGeoLayer(state.filteredFeatures);
+  }
+
+  function updateAggregation(){
+    if(state.selectedZips.size===0){state.aggregatedData=[];renderTable([]);return;}
+    const selected = allFeatures.filter(f=>state.selectedZips.has(f.properties[zipKey]));
+    const groups={};
+    selected.forEach(f=>{
+      const z=f.properties[zipKey];
+      if(!groups[z])groups[z]=[];
+      groups[z].push(f.properties);
+    });
+    const results=Object.entries(groups).map(([z,rows])=>{
+      const rec={[zipKey]:z};
+      numericFields.forEach(field=>{
+        const vals=rows.map(r=>r[field]).filter(v=>typeof v==='number');
+        rec[field]=/pct|percent/i.test(field)?vals.reduce((a,b)=>a+b,0)/vals.length:vals.reduce((a,b)=>a+b,0);
+      });
+      return rec;
+    });
+    state.aggregatedData=results;
+    renderTable(results);
+  }
+
+  function renderTable(data){
+    const thead=document.querySelector('#summary thead'),tbody=document.querySelector('#summary tbody');
+    if ($.fn.dataTable.isDataTable('#summary')) $('#summary').DataTable().clear().destroy();
+    thead.innerHTML='';tbody.innerHTML='';
+    if(!data.length){thead.innerHTML='<tr><th>No data</th></tr>';return;}
+    const cols=Object.keys(data[0]);
+    const headRow=document.createElement('tr');
+    cols.forEach(c=>{const th=document.createElement('th');th.textContent=c+(c!==zipKey?(/pct|percent/i.test(c)?' (Avg)':' (Sum)'):'');headRow.appendChild(th);});
+    thead.appendChild(headRow);
+    data.forEach(r=>{
+      const tr=document.createElement('tr');
+      cols.forEach(c=>{
+        const td=document.createElement('td');
+        const v=r[c];
+        td.textContent=typeof v==='number'?(/pct|percent/i.test(c)?v.toFixed(1)+'%':Math.round(v).toLocaleString()):v;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    $('#summary').DataTable();
+  }
+
+  function updateStats(){
+    document.getElementById('filteredCount').textContent=state.filteredFeatures.length;
+    document.getElementById('selectedCount').textContent=allFeatures.filter(f=>state.selectedZips.has(f.properties[zipKey])).length;
+    document.getElementById('uniqueZipsCount').textContent=state.selectedZips.size;
+  }
+
+  function applyFilters(){
+    state.filteredFeatures = allFeatures.filter(f=>{
+      for(const field in state.filters){
+        const {min,max} = state.filters[field];
+        const v = f.properties[field];
+        if(min!==null && v<min) return false;
+        if(max!==null && v>max) return false;
+      }
+      const query=document.getElementById('zipSearch').value.trim().toLowerCase();
+      if(query && !String(f.properties[zipKey]).toLowerCase().includes(query)) return false;
+      return true;
+    });
+  }
+
+  function updateDisplay(){
+    applyFilters();
+    createGeoLayer(state.filteredFeatures);
+    updateAggregation();
+    updateStats();
+  }
+
+  // build filter UI
+  numericFields.forEach(field=>{
+    state.filters[field]={min:null,max:null};
+    const row=document.createElement('div');row.className='filter-row';
+    const label=document.createElement('div');label.className='filter-label';label.textContent=field;
+    const min=document.createElement('input');min.type='number';min.className='filter-input';min.placeholder='Min';
+    const max=document.createElement('input');max.type='number';max.className='filter-input';max.placeholder='Max';
+    min.addEventListener('input',()=>{state.filters[field].min=min.value===''?null:+min.value;updateDisplay();});
+    max.addEventListener('input',()=>{state.filters[field].max=max.value===''?null:+max.value;updateDisplay();});
+    row.append(label,min,max);document.getElementById('filters').appendChild(row);
+  });
+  document.getElementById('zipSearch').addEventListener('input',updateDisplay);
+
+  const drawnItems=new L.FeatureGroup().addTo(map);
+  const drawControl=new L.Control.Draw({edit:{featureGroup:drawnItems},draw:{marker:false,circle:false,polyline:false,circlemarker:false,rectangle:true,polygon:true}});
+  map.addControl(drawControl);
+  map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);state.drawnLayer=e.layer;selectFeaturesInDrawnArea();});
+  map.on(L.Draw.Event.EDITED,()=>{state.drawnLayer=drawnItems.getLayers()[0]||null;selectFeaturesInDrawnArea();});
+  map.on(L.Draw.Event.DELETED,()=>{state.drawnLayer=null;updateAggregation();updateStats();});
+
+  createGeoLayer(allFeatures);
+  map.fitBounds(window.geoLayer.getBounds());
+})();
+</script>
+</body>
+</html>
